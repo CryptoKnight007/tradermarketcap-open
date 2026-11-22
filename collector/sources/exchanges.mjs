@@ -32,6 +32,7 @@ export const VENUES = {
   bitfinex: { name: 'Bitfinex', type: 'Exchange', site: 'https://www.bitfinex.com' },
   htx: { name: 'HTX', type: 'Exchange', site: 'https://www.htx.com' },
   gemini: { name: 'Gemini', type: 'Exchange', site: 'https://www.gemini.com' },
+  bithumb: { name: 'Bithumb', type: 'Exchange', site: 'https://www.bithumb.com' },
 };
 
 // Bitfinex writes some symbols with a colon (tLINK:USD, tAVAX:USD) and others joined (tBTCUSD),
@@ -502,5 +503,27 @@ export const READERS = {
         trade: `https://exchange.gemini.com/trade/${r.symbol.toUpperCase()}`,
       };
     });
+  },
+  // Bithumb's ALL_KRW ticker is priced in KRW; the same answer carries the
+  // USDT-KRW price, which converts everything to USD. Fail if it is missing.
+  async bithumb() {
+    const d = await getJSON('https://api.bithumb.com/public/ticker/ALL_KRW', { timeout: 25000 });
+    if (d.status !== '0000' || !d.data || typeof d.data !== 'object') throw new Error(`bithumb status ${d.status}`);
+    const krwPerUsd = n(d.data.USDT?.closing_price);
+    if (!krwPerUsd) throw new Error('bithumb USDT-KRW price missing');
+    const out = [];
+    for (const [b, v] of Object.entries(d.data)) {
+      if (b === 'USDT') continue; // conversion rate, not a market: USDT/USDT would pin price at 1
+      const base = sym(b);
+      if (!base || typeof v !== 'object' || v === null) continue;
+      out.push({
+        venue: 'bithumb', base, quote: 'USD', price: n(v.closing_price) != null ? n(v.closing_price) / krwPerUsd : null,
+        volBase: n(v.units_traded_24H), volQuote: n(v.acc_trade_value_24H) != null ? n(v.acc_trade_value_24H) / krwPerUsd : null,
+        change24h: n(v.fluctate_rate_24H),
+        api: `https://api.bithumb.com/public/ticker/${b}_KRW`,
+        trade: `https://www.bithumb.com/react/trade/order/${b}-KRW`,
+      });
+    }
+    return out;
   },
 };
