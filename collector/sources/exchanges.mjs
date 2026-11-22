@@ -13,6 +13,10 @@ function splitJoined(s) {
   return [null, null];
 }
 
+// Binance.US keeps serving the last 24h figures of delisted and halted pairs (closeTime stays at the last trade day:
+// on 2026-11-22 that was 195 pairs worth $95M of "volume"). Those are not markets.
+const frozen = v => n(v.closeTime) != null && Date.now() - n(v.closeTime) > 864e5;
+
 export const VENUES = {
   coinbase: { name: 'Coinbase', type: 'Exchange', site: 'https://www.coinbase.com' },
   kraken: { name: 'Kraken', type: 'Exchange', site: 'https://www.kraken.com' },
@@ -259,7 +263,7 @@ export const READERS = {
     const out = [];
     for (const v of d) {
       const [b, q] = splitJoined(v.symbol);
-      if (!keep(b, q)) continue;
+      if (!keep(b, q) || frozen(v)) continue;
       out.push({
         venue: 'binanceus', base: b, quote: q, price: n(v.lastPrice), volBase: n(v.volume), volQuote: n(v.quoteVolume),
         change24h: n(v.priceChangePercent),

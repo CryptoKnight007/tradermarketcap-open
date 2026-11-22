@@ -343,3 +343,9 @@ test('gemini: volume calls stay under the limit and a shared book is counted onc
   await fresh.READERS.gemini();
   assert.equal(tickers().length, 15); // straight after, the cache answers
 });
+
+test('binance.us: pairs with frozen 24h figures (delisted or halted) are not markets', async () => {
+  const row = (symbol, closeTime) => ({ symbol, lastPrice: '2', volume: '5', quoteVolume: '10', priceChangePercent: '1', closeTime });
+  fakeFetch([row('BTCUSDT', Date.now()), row('BUSDUSDT', Date.now() - 3 * 864e5)]);
+  assert.deepEqual((await READERS.binanceus()).map(m => m.base), ['BTC']);
+});
