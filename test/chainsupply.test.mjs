@@ -615,3 +615,9 @@ test('algorand: a malformed account balance fails the read instead of publishing
   };
   await assert.rejects(readSupply({ method: 'algorand', api: 'https://algod.test', exclude: [{ holder: 'WALLET_A', reason: 'test' }] }), /bad Algorand balance/);
 });
+
+test('aptos: totals read moments apart (a few thousand APT) still agree', async () => {
+  fakeAptos({ pub: { current_circulating_supply: 889397967.12, current_total_supply: 1211984907.54 } });
+  const s = await readSupply({ method: 'aptos' });
+  assert.ok(Math.abs(s.circulating - 889397967.12) < 1e-4);
+});

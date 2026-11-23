@@ -391,9 +391,10 @@ const METHODS = {
     const pubTotal = Number(pub?.current_total_supply);
     if (!(circ > 0) || !(pubTotal > 0)) throw new Error('aptos: foundation supply API returned no supply');
     if (!(circ <= pubTotal)) throw new Error(`aptos: circulating ${circ} exceeds total ${pubTotal}`);
-    // The Foundation's total and the chain must agree to within rounding; if the API goes stale
+    // The Foundation's total and the chain must agree within 0.01% (the two are read moments apart, a few thousand APT);
+    // a stale or wrong-network API is off by millions. If the API goes stale
     // or switches networks, fail rather than publish a figure we cannot corroborate.
-    if (Math.abs(pubTotal - total) > 1) throw new Error(`aptos: foundation total ${pubTotal} != chain total ${total}`);
+    if (Math.abs(pubTotal - total) > total * 1e-4) throw new Error(`aptos: foundation total ${pubTotal} != chain total ${total}`);
     return {
       circulating: circ,
       total,
