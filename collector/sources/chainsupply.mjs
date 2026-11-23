@@ -225,6 +225,33 @@ const METHODS = {
     }
     return { circulating: total - excluded.reduce((s, e) => s + e.amount, 0), total, src: r.explorer || r.lcd, excluded, note: r.note };
   },
+  // Algorand: total ALGO from a public algod node, minus the Algorand Foundation wallets the Foundation
+  // publishes at algorand.co/algorand-foundation/transparency (archived copy cited in coins.json; the
+  // list is embedded there; each balance is read live. algod answers 200 with amount 0 for closed
+  // accounts, so any request error fails the read rather than counting 0).
+  async algorand(r) {
+    const api = r.api;
+    const total = Number((await getJSON(`${api}/v2/ledger/supply`))['total-money']) / 1e6;
+    if (!(total > 8e9)) throw new Error('bad Algorand total supply ' + total);
+    const excluded = [];
+    for (const e of r.exclude || []) {
+      const amount = Number((await getJSON(`${api}/v2/accounts/${e.holder}`)).amount) / 1e6;
+      if (!Number.isFinite(amount) || amount < 0) throw new Error('bad Algorand balance for ' + e.holder); // a malformed answer must fail, never publish NaN
+      excluded.push({ reason: e.reason, holder: e.holder, amount, src: `https://allo.info/account/${e.holder}` });
+    }
+    // The Foundation's published wallet list can drift from its reported balance; when a
+    // reportedFloor is configured, subtract the larger of the live wallet sum and the floor
+    // (same pattern as bnb's burn-tracker cap).
+    let subtract = excluded.reduce((s, e) => s + e.amount, 0);
+    if (r.reportedFloor) {
+      const floor = Number(r.reportedFloor);
+      if (floor > subtract) {
+        excluded.push({ reason: 'Algorand Foundation reported balance (Q2 2026 transparency report)', amount: floor - subtract, src: r.reportedFloorSrc });
+        subtract = floor;
+      }
+    }
+    return { circulating: total - subtract, total, src: api, excluded, note: r.note };
+  },
   // BNB: chain-read ceiling checked against BNB Chain's burn tracker; the lower one is circulating (see top of file).
   async bnb() {
     const [hub, dead, zero, tracker] = await Promise.all([bscBalance(BSC_TOKENHUB), bscBalance(BURN), bscBalance(BSC_ZERO), bnbTracker()]);
@@ -331,6 +358,51 @@ const METHODS = {
       excluded: [{ reason: 'Locked allocations (foundation, community reserve, early supporters)', amount: total - circ, src: 'https://blog.sui.io/token-release-schedule/' }],
       note: 'Total from Sui GraphQL; circulating from the official Sui Explorer circulation API (Sui JSON-RPC is deprecated). Stake rewards are circulating when paid' };
   },
+  // Aptos (APT): the Aptos Foundation publishes its own live supply API, linked as "Current
+  // Token Supply API" on the Mainnet row of aptos.dev/network/nodes/networks. That is a
+  // first-party source and it already nets out the locked community/foundation vesting tranches
+  // and the 210M APT permanent stake commitment from AIP-140, which is exactly what issue #5
+  // asks for. Its current_total_supply is cross-checked against a chain read of 0x1::coin::supply
+  // every pass, so a diverging, stale or wrong-network endpoint fails the read instead of
+  // publishing a number we cannot corroborate. Gas fees are burned on Aptos, so they are
+  // already out of both figures.
+  async aptos() {
+    const SUPPLY_API = 'https://aptos-supply.dev.gcp.aptosdev.com/supply';
+    const url = 'https://api.mainnet.aptoslabs.com/v1/view';
+    const [pub, res] = await Promise.all([
+      getJSON(SUPPLY_API),
+      getJSON(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          function: '0x1::coin::supply',
+          type_arguments: ['0x1::aptos_coin::AptosCoin'],
+          arguments: [],
+        }),
+      }),
+    ]);
+    // Shape is [{ vec: ["<amount>"] }]; older nodes answered [["<amount>"]]. Octas, 8 decimals.
+    const first = Array.isArray(res) ? res[0] : null;
+    const raw = Array.isArray(first) ? first[0] : Array.isArray(first?.vec) ? first.vec[0] : null;
+    if (typeof raw !== 'string' || !/^\d+$/.test(raw)) throw new Error('aptos: no integer supply in view response');
+    const total = Number(raw) / 1e8;
+    if (!(total > 0)) throw new Error(`aptos: bad total supply ${total}`);
+    const circ = Number(pub?.current_circulating_supply);
+    const pubTotal = Number(pub?.current_total_supply);
+    if (!(circ > 0) || !(pubTotal > 0)) throw new Error('aptos: foundation supply API returned no supply');
+    if (!(circ <= pubTotal)) throw new Error(`aptos: circulating ${circ} exceeds total ${pubTotal}`);
+    // The Foundation's total and the chain must agree to within rounding; if the API goes stale
+    // or switches networks, fail rather than publish a figure we cannot corroborate.
+    if (Math.abs(pubTotal - total) > 1) throw new Error(`aptos: foundation total ${pubTotal} != chain total ${total}`);
+    return {
+      circulating: circ,
+      total,
+      src: SUPPLY_API,
+      parts: [{ chain: 'aptos', amount: total, src: url }],
+      excluded: [],
+      note: `Circulating is the Aptos Foundation's own published figure from its Current Token Supply API (${SUPPLY_API}, linked from aptos.dev), which already nets out locked community/foundation vesting and the 210M APT AIP-140 permanent stake. Total is the live chain read of 0x1::coin::supply and agrees with the Foundation's reported total to within 1 APT. Gas fees are burned, so they are already excluded from both.`,
+    };
+  },
   // Jupiter's own Token API publishes circulating supply for its tokens, already net of
   // locked team/community allocations and Jupiter Lock vesting escrows (see the JUP
   // community audits on discuss.jup.ag for the wallet breakdown).
@@ -343,6 +415,44 @@ const METHODS = {
     return { circulating: circ, total, src: url,
       excluded: [{ reason: 'Locked team/community allocations and Jupiter Lock vesting escrows', amount: total - circ, src: 'https://discuss.jup.ag/t/jup-community-audit-feb-2025/34764' }],
       note: 'Jupiter Token API circSupply: locked team/community wallets and unvested Jupiter Lock escrows excluded by Jupiter' };
+  },
+  // Quant (QNT): the contract's totalSupply() is NOT the live supply and must not be published as one.
+  // The counter was seeded with the 45,467,000 planned cap in 2018 and never decremented: the September 2018
+  // burn moved 9,545,765.95 unsold QNT to the contract's own address instead of reducing the count, so the
+  // counter still reads 45,467,000 while only about 24.16M was ever minted. Quant's own burn announcement
+  // publishes the post-burn total: 14,612,493.080826178 QNT (9,964,259.03181537 public + 4,648,234.049010808
+  // company). We publish that disclosed total and subtract only balances that can provably never move again:
+  // the remainder parked at the contract address (its balance minus the disclosed burn) and the burn address.
+  // QNT has no contractual company, team or foundation lock, so company holdings count as circulating.
+  async quant(r) {
+    const token = r.address;
+    const disclosedTotal = Number(r.disclosedTotal);
+    const burned = Number(r.burnedAt2018);
+    if (!(disclosedTotal > 0) || !(burned > 0)) throw new Error('quant: rule needs disclosedTotal and burnedAt2018');
+    const [rawCounter, atContract, atBurn] = await Promise.all([
+      erc20TotalSupply('eth', token),
+      erc20Balance('eth', token, token),
+      erc20Balance('eth', token, BURN),
+    ]);
+    // If the counter ever stops being the pre-burn artefact, this rule's reasoning is stale: fail rather than guess.
+    if (!(rawCounter > disclosedTotal * 1.1)) throw new Error(`quant: totalSupply() ${rawCounter} is not the pre-burn counter`);
+    // The burned tokens have to still be sitting at the contract address, or the burn was moved and our arithmetic is wrong.
+    if (!(atContract >= burned)) throw new Error(`quant: burn not at contract address (${atContract} < ${burned})`);
+    const stray = atContract - burned;
+    const excluded = [
+      { reason: 'Burned 2018 remainder parked at the token contract (no contract function can move it)', holder: token, amount: stray, src: holderLink({ chain: 'eth', address: token }, token) },
+      { reason: 'Burn address', holder: BURN, amount: atBurn, src: holderLink({ chain: 'eth', address: token }, BURN) },
+    ].filter(e => e.amount > 0);
+    const circulating = disclosedTotal - excluded.reduce((s, e) => s + e.amount, 0);
+    if (!(circulating > 0)) throw new Error('quant: bad circulating supply');
+    // The company held 4,648,234.05 QNT at the burn and has never disclosed what it holds
+    // since, so a circulating figure built from the 2018 split would overstate it. Publishing
+    // total only is the honest answer (same shape as ENA/PYTH).
+    const publish = r.circulating !== false;
+    return { circulating: publish ? circulating : null, total: disclosedTotal, src: 'https://x.com/quantnetwork/status/1043093247839678464', excluded,
+      note: publish
+        ? `Total is Quant's own post-burn disclosure (14 Sep 2018), not totalSupply(): the contract counter still reads ${rawCounter.toLocaleString('en-US')} because the burn moved tokens to the contract address instead of decrementing it.`
+        : `Total is Quant's own post-burn disclosure (14 Sep 2018), not totalSupply(): the contract counter still reads ${rawCounter.toLocaleString('en-US')} because the burn moved tokens to the contract address instead of decrementing it. ${r.note || 'Circulating supply is not published.'}` };
   },
   async extra() {
     return extraSupply();

@@ -143,6 +143,151 @@ test('sui: a broken API answer fails the read', async () => {
   finally { restore(); }
 });
 
+// AERO on Base. Values below are the live reads on 2026-11-23, Base block 61,194,455:
+// new AERO totalSupply 2,149,873,046, sAERO 1,080,578,812, and the two migration vaults
+// 274,913,277 + 10,614,436. Aero's upgrade page publishes ~1.07B as the MAXIMUM circulating
+// supply after every holder upgrades and says tokens never upgraded never reach circulation,
+// so AERO parked in the migration contracts is not circulating. The three exclusions
+// reconcile: 783,766,521 circulating + 285,527,713 in the vaults = 1,069,294,234, which is
+// exactly total less sAERO, i.e. the published ~1.07B maximum.
+const AERO = '0x3f5bf3edac59d650d8fdf9657a71f2f904a3a4ee';
+const AERO_SAERO = '0xbf7977e1521e9a3032bf7243ee4712f311f13915';
+const AERO_VAULTS = ['0x22a2f7340a3fb4c7c389d91ee954766b12476721', '0x6dae95fe833f190640db1176f8c8a2e50c6a66c0'];
+const AERO_EXCLUDE = [
+  { chain: 'base', holder: '0xBF7977E1521e9a3032bf7243Ee4712f311f13915', reason: 'sAERO' },
+  { chain: 'base', holder: '0x22a2F7340a3fB4C7C389D91eE954766B12476721', reason: 'migration vault' },
+  { chain: 'base', holder: '0x6daE95FE833f190640dB1176F8C8a2e50C6a66c0', reason: 'migration vault' },
+];
+
+function fakeBase({ total = '0x' + (2149873046n * 10n ** 18n).toString(16),
+                    saero = '0x' + (1080578812n * 10n ** 18n).toString(16),
+                    vault1 = '0x' + (274913277n * 10n ** 18n).toString(16),
+                    vault2 = '0x' + (10614436n * 10n ** 18n).toString(16),
+                    failAt = null } = {}) {
+  const balances = { [AERO_SAERO]: saero, [AERO_VAULTS[0]]: vault1, [AERO_VAULTS[1]]: vault2 };
+  const seen = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    const req = JSON.parse(opts.body);
+    const reply = result => ({ ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, result }) });
+    const { to, data } = req.params[0];
+    seen.push({ to: to.toLowerCase(), selector: data.slice(0, 10) });
+    if (data.startsWith('0x313ce567')) return reply('0x' + (18).toString(16).padStart(64, '0'));
+    if (data.startsWith('0x18160ddd')) return reply(total);
+    const holder = '0x' + data.slice(-40);
+    if (failAt === holder) return { ok: false, status: 500, json: async () => ({ error: 'boom' }) };
+    return reply(balances[holder] || '0x' + (0n).toString(16));
+  };
+  return seen;
+}
+
+const aeroRule = () => ({ method: 'tokens', parts: [{ chain: 'base', address: '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee' }], exclude: AERO_EXCLUDE });
+
+test('aero: circulating subtracts sAERO and both migration vaults, and the three reconcile to the published ~1.07B maximum', async () => {
+  const seen = fakeBase();
+  const s = await readSupply(aeroRule());
+  assert.equal(s.total, 2149873046);
+  for (const h of [AERO_SAERO, ...AERO_VAULTS]) {
+    const e = s.excluded.find(x => x.holder.toLowerCase() === h);
+    assert.ok(e, `excluded ${h}`);
+  }
+  // each excluded balance is subtracted exactly once
+  assert.equal(s.excluded.find(e => e.holder.toLowerCase() === AERO_SAERO).amount, 1080578812);
+  assert.equal(s.excluded.find(e => e.holder.toLowerCase() === AERO_VAULTS[0]).amount, 274913277);
+  assert.equal(s.excluded.find(e => e.holder.toLowerCase() === AERO_VAULTS[1]).amount, 10614436);
+  assert.equal(s.circulating, 2149873046 - 1080578812 - 274913277 - 10614436);
+  // circulating + still-unclaimed vault balances == total less sAERO == Aero's published max (~1.07B)
+  const max = s.circulating + 274913277 + 10614436;
+  assert.ok(Math.abs(max - 1.07e9) < 1e7, `reconciles to ~1.07B, got ${max}`);
+  // circulating can never exceed the published maximum
+  assert.ok(s.circulating < 1.07e9);
+  // only the live AERO contract is queried
+  assert.ok(seen.every(c => c.to === AERO));
+});
+
+test('aero: a failed migration-vault balance read throws instead of publishing an overstated circulating', async () => {
+  fakeBase({ failAt: AERO_VAULTS[0] });
+  await assert.rejects(readSupply(aeroRule()));
+});
+
+test('aero: a failed sAERO balance read throws instead of publishing an overstated circulating', async () => {
+  fakeBase({ failAt: AERO_SAERO });
+  await assert.rejects(readSupply(aeroRule()));
+});
+
+// Real shapes captured 2026-11-23.
+// Chain: POST api.mainnet.aptoslabs.com/v1/view {function:'0x1::coin::supply'}
+//        -> [{"vec":["121198072837308975"]}]
+// Foundation: GET aptos-supply.dev.gcp.aptosdev.com/supply
+//        -> {current_circulating_supply:889393790.55, current_total_supply:1211980728.41, ...}
+function fakeAptos({ chain = [{ vec: ['121198072837308975'] }],
+                     pub = { current_circulating_supply: 889393790.5553615, current_total_supply: 1211980728.417503 },
+                     pubFails = false } = {}) {
+  const calls = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    calls.push(u);
+    if (u.includes('aptos-supply')) {
+      if (pubFails) return { ok: false, status: 500, json: async () => ({ error: 'boom' }) };
+      return { ok: true, status: 200, json: async () => pub };
+    }
+    assert.ok(u.includes('api.mainnet.aptoslabs.com/v1/view'), 'only the mainnet chain view is called');
+    const req = JSON.parse(opts.body);
+    assert.equal(req.function, '0x1::coin::supply');
+    assert.deepEqual(req.type_arguments, ['0x1::aptos_coin::AptosCoin']);
+    return { ok: true, status: 200, json: async () => chain };
+  };
+  return calls;
+}
+
+test('aptos: circulating is the Foundation\'s published figure and total is the chain read', async () => {
+  const calls = fakeAptos();
+  const s = await readSupply({ method: 'aptos', max: 2100000000 });
+  assert.ok(Math.abs(s.total - 1211980728.3730898) < 1e-5, 'total from the chain read');
+  assert.ok(Math.abs(s.circulating - 889393790.5553615) < 1e-4, 'circulating from the Foundation API');
+  assert.ok(s.circulating < s.total);
+  assert.equal(s.checked, true);
+  assert.equal(s.max, 2100000000);
+  // both first-party endpoints were actually consulted
+  assert.ok(calls.some(u => u.includes('aptos-supply')), 'Foundation supply API queried');
+  assert.ok(calls.some(u => u.includes('api.mainnet.aptoslabs.com/v1/view')), 'chain queried');
+  assert.match(s.note, /Foundation/i);
+});
+
+test('aptos: the older nested-array chain shape is read too', async () => {
+  fakeAptos({ chain: [['121198072837308975']] });
+  const s = await readSupply({ method: 'aptos' });
+  assert.ok(Math.abs(s.total - 1211980728.3730898) < 1e-5);
+  assert.ok(Math.abs(s.circulating - 889393790.5553615) < 1e-4);
+});
+
+test('aptos: a Foundation total that disagrees with the chain fails instead of publishing', async () => {
+  // stale or wrong-network API: its total is far from the chain's
+  fakeAptos({ pub: { current_circulating_supply: 654537401.49, current_total_supply: 1151290520.58 } });
+  await assert.rejects(readSupply({ method: 'aptos' }), /foundation total .* != chain total/);
+});
+
+test('aptos: a Foundation API failure fails the read instead of guessing circulating', async () => {
+  fakeAptos({ pubFails: true });
+  await assert.rejects(readSupply({ method: 'aptos' }));
+});
+
+test('aptos: circulating above total is rejected', async () => {
+  fakeAptos({ pub: { current_circulating_supply: 1300000000, current_total_supply: 1211980728.417503 } });
+  await assert.rejects(readSupply({ method: 'aptos' }), /circulating .* exceeds total/);
+});
+
+test('aptos: a missing or junk supply answer fails the read instead of publishing 0', async () => {
+  fakeAptos({ chain: [{ vec: [] }] });
+  try { await assert.rejects(readSupply({ method: 'aptos' }), /no integer supply/); }
+  finally { globalThis.fetch = realFetch; }
+  fakeAptos({ chain: [{ vec: ['12.5e6'] }] });
+  try { await assert.rejects(readSupply({ method: 'aptos' }), /no integer supply/); }
+  finally { globalThis.fetch = realFetch; }
+  fakeAptos({ chain: [] });
+  try { await assert.rejects(readSupply({ method: 'aptos' }), /no integer supply/); }
+  finally { globalThis.fetch = realFetch; }
+});
+
 // Real response shapes captured from tonapi.io and toncenter.com on 2026-11-22.
 function fakeTon({
   seqno = 106899815,
@@ -301,4 +446,172 @@ test('pyth: a treasury wallet that has moved fails the read rather than guessing
     assert.equal(s.excluded.length, 0, 'a zero balance is not reported as an exclusion');
     assert.ok(Math.abs(s.total - 9999958592.238969) < 0.01);
   } finally { restore(); }
+});
+
+// QNT: totalSupply() on 0x4a22...4675 is a pre-burn artefact (it reads 45,467,000 forever because the
+// 2018 burn parked the unsold tokens at the contract address instead of decrementing the counter).
+// Real values read on Ethereum mainnet, 2026-11-22:
+//   totalSupply()            45,467,000
+//   balanceOf(contract)       9,550,897.141327927
+//   balanceOf(0x...dEaD)          0.11700656748701552
+const QNT = '0x4a220E6096B25EADb88358cb44068A3248254675';
+const QNT_TOTAL_HEX = '0x000000000000000000000000000000000000000000259c03024205ba6ae00000'; // 45,467,000
+const QNT_CONTRACT_HEX = '0x00000000000000000000000000000000000000000007e67b2be6cff4afd16600'; // 9,550,897.141327927
+const QNT_DEAD_HEX = '0x000000000000000000000000000000000000000000000000019fb0da6b738a60'; // 0.11700656748701552
+
+function fakeQuant({ total = QNT_TOTAL_HEX, atContract = QNT_CONTRACT_HEX, atBurn = QNT_DEAD_HEX } = {}) {
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    const req = JSON.parse(opts.body);
+    const data = req.params[0].data;
+    calls.push(data);
+    const reply = result => ({ ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, result }) });
+    if (data.startsWith('0x313ce567')) return reply('0x' + '12'.padStart(64, '0')); // 18 decimals
+    if (data.startsWith('0x18160ddd')) return reply(total);
+    // balanceOf: which holder?
+    const holder = '0x' + data.slice(-40);
+    return reply(holder === '0x000000000000000000000000000000000000dead' ? atBurn : atContract);
+  };
+  return { calls, restore: () => { globalThis.fetch = realFetch; } };
+}
+
+const QNT_RULE = {
+  method: 'quant',
+  address: QNT,
+  disclosedTotal: 14612493.080826178,
+  burnedAt2018: 9545765.95,
+  max: 14612493.080826178,
+};
+
+// Live rule as shipped: circulating is unpublished because Quant's current company holdings
+// are unknown, so only the total (a fixed, disclosed number) is published.
+const QNT_SHIPPED = { ...QNT_RULE, circulating: false };
+
+test('quant: publishes the disclosed post-burn total, not the 45.4M totalSupply() artefact', async () => {
+  const f = fakeQuant();
+  try {
+    const s = await readSupply(QNT_RULE);
+    // the counter is read (to prove it is still the artefact) but must never become the published total
+    assert.ok(f.calls.some(d => d.startsWith('0x18160ddd')), 'totalSupply() was queried');
+    assert.equal(s.total, 14612493.080826178);
+    assert.ok(s.total < 45467000, 'the pre-burn counter is not published as supply');
+    assert.equal(s.checked, true);
+    assert.ok(Math.abs(s.circulating - 14607361.772491684) < 1e-6);
+    assert.ok(s.circulating < s.total);
+    // excluded: the burned remainder parked at the contract, plus the burn address
+    assert.equal(s.excluded.length, 2);
+    const parked = s.excluded.find(e => e.holder.toLowerCase() === QNT.toLowerCase());
+    assert.ok(Math.abs(parked.amount - 5131.191327927) < 1e-6);
+    assert.match(parked.reason, /parked at the token contract/i);
+    assert.ok(Math.abs(s.excluded.reduce((a, e) => a + e.amount, 0) + s.circulating - s.total) < 1e-6,
+      'excluded balances explain the whole gap');
+  } finally { f.restore(); }
+});
+
+test('quant: circulating:false publishes the total and leaves circulating unpublished', async () => {
+  const f = fakeQuant();
+  try {
+    const s = await readSupply(QNT_SHIPPED);
+    assert.equal(s.total, 14612493.080826178);
+    assert.equal(s.circulating, null, 'circulating is unpublished, never a guess');
+    assert.equal(s.checked, true);
+    // the burn evidence is still reported, so a reader can see what was reconciled
+    assert.equal(s.excluded.length, 2);
+    assert.match(s.note, /not totalSupply/);
+  } finally { f.restore(); }
+});
+
+test('quant: the shipped rule publishes total only and explains the unpublished circulating', () => {
+  const coins = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url)));
+  const rule = coins.quant.supply;
+  assert.equal(rule.circulating, false, 'shipped rule leaves circulating unpublished');
+  assert.equal(rule.disclosedTotal, 14612493.080826178);
+  // the note must name the reason a reader would look for
+  assert.match(rule.note, /Circulating supply is not published/);
+  assert.match(rule.note, /company/i);
+  assert.match(rule.note, /4,648,234/);
+});
+
+test('quant: a counter that is no longer the pre-burn artefact fails instead of guessing', async () => {
+  // 14.7M — i.e. someone finally decremented the counter. This rule's reasoning no longer holds.
+  const f = fakeQuant({ total: '0x' + BigInt(14700000 * 1e18).toString(16) });
+  try { await assert.rejects(readSupply(QNT_RULE), /not the pre-burn counter/); }
+  finally { f.restore(); }
+});
+
+test('quant: if the burned tokens are not at the contract address the read fails', async () => {
+  const f = fakeQuant({ atContract: '0x' + BigInt(5000 * 1e18).toString(16) });
+  try { await assert.rejects(readSupply(QNT_RULE), /burn not at contract address/); }
+  finally { f.restore(); }
+});
+
+test('quant: a rule missing the disclosed total fails rather than publishing totalSupply()', async () => {
+  const f = fakeQuant();
+  try { await assert.rejects(readSupply({ method: 'quant', address: QNT }), /disclosedTotal and burnedAt2018/); }
+  finally { f.restore(); }
+});
+
+
+// Fake algod: /v2/ledger/supply returns the given microAlgos total, /v2/accounts/<addr> returns
+// ACCOUNTS[addr] microAlgos. algod answers 200 with amount 0 for closed accounts; a missing
+// key answers 404, which must now fail the read rather than count 0.
+const ALGO_ACCOUNTS = {
+  WALLET_A: '5000000000', // 5,000 ALGO
+  WALLET_B: '2500000000', // 2,500 ALGO
+  CLOSED_WALLET: '0',
+};
+function fakeAlgod(totalMicro) {
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.endsWith('/v2/ledger/supply')) return { ok: true, status: 200, json: async () => ({ 'total-money': String(totalMicro) }) };
+    const m = u.match(/\/v2\/accounts\/([^/?]+)$/);
+    if (m && m[1] in ALGO_ACCOUNTS) return { ok: true, status: 200, json: async () => ({ amount: ALGO_ACCOUNTS[m[1]] }) };
+    if (m) return { ok: false, status: 404, json: async () => ({}) };
+    throw new Error('unexpected url ' + u);
+  };
+}
+const ALGO_RULE = { method: 'algorand', api: 'https://algod.test', exclude: [
+  { holder: 'WALLET_A', reason: 'Algorand Foundation treasury' },
+  { holder: 'WALLET_B', reason: 'Algorand Foundation governance' },
+  { holder: 'CLOSED_WALLET', reason: 'Algorand Foundation treasury' },
+] };
+
+test('algorand: foundation wallets are read live and subtracted from total supply', async () => {
+  fakeAlgod(9821368789728523); // ~9.82B ALGO in microAlgos
+  const s = await readSupply(ALGO_RULE);
+  assert.ok(Math.abs(s.total - 9821368789.728523) < 0.001);
+  assert.ok(Math.abs(s.circulating - (9821368789.728523 - 7500)) < 0.001);
+  assert.equal(s.excluded.length, 3);
+  assert.equal(s.excluded[2].amount, 0); // closed account answers 200 amount 0
+});
+
+test('algorand: a nonsense total fails the read', async () => {
+  fakeAlgod(1000);
+  await assert.rejects(readSupply(ALGO_RULE), /bad Algorand total supply/);
+});
+
+test('algorand: reportedFloor above the live wallet sum is subtracted instead', async () => {
+  fakeAlgod(9821368789728523);
+  const s = await readSupply({ ...ALGO_RULE, reportedFloor: 8000, reportedFloorSrc: 'https://example.com/report.pdf' });
+  assert.ok(Math.abs(s.circulating - (9821368789.728523 - 8000)) < 0.001);
+  assert.equal(s.excluded.length, 4);
+  assert.equal(s.excluded[3].amount, 500); // 8000 floor - 7500 live
+  assert.equal(s.excluded[3].src, 'https://example.com/report.pdf');
+});
+
+test('algorand: reportedFloor below the live wallet sum changes nothing', async () => {
+  fakeAlgod(9821368789728523);
+  const s = await readSupply({ ...ALGO_RULE, reportedFloor: 100 });
+  assert.ok(Math.abs(s.circulating - (9821368789.728523 - 7500)) < 0.001);
+  assert.equal(s.excluded.length, 3);
+});
+
+test('algorand: a malformed account balance fails the read instead of publishing NaN', async () => {
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.endsWith('/v2/ledger/supply')) return { ok: true, status: 200, json: async () => ({ 'total-money': '9821368789728523' }) };
+    return { ok: true, status: 200, json: async () => ({ address: 'X' }) }; // no amount field
+  };
+  await assert.rejects(readSupply({ method: 'algorand', api: 'https://algod.test', exclude: [{ holder: 'WALLET_A', reason: 'test' }] }), /bad Algorand balance/);
 });
