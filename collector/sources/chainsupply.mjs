@@ -34,6 +34,26 @@ const VVV = '0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf';
 const VVV_STATS = 'https://api.venice.ai/api/app/vvv/vvv_stats';
 const VVV_BURN_STATS = 'https://api.venice.ai/api/app/vvv/vvv_burn_stats';
 const ZERO = '0x0000000000000000000000000000000000000000';
+// WLD (Worldcoin): the ERC-20 on Ethereum holds the whole 10B supply. WLD on Optimism is an OptimismMintableERC20 whose
+// remoteToken() is the Ethereum WLD and whose bridge is OP's L2StandardBridge (0x4200...0010): every WLD there is
+// backed by WLD locked in OP Mainnet's L1StandardBridge on Ethereum, so it is checked, not added. World Chain's WLD is
+// bridged the same way (World Chain L1StandardBridge, Etherscan label "World Chain: L1 Standard Bridge Proxy").
+const WLD_ETH = '0x163f8C2467924be0ae7B5347228CABF260318753';
+const WLD_OP = '0xdC6fF44d5d932Cbd77B52E5612Ba0529DC6226F1';
+const OP_L1_BRIDGE = '0x99C9fc46f92E8a1c0deC1b1747d010903E884bE1';
+const OP_L2_BRIDGE = '0x4200000000000000000000000000000000000010';
+const WORLDCHAIN_L1_BRIDGE = '0x470458C91978D2d929704489Ad730DC3E3001113';
+// World's own list of WLD contracts and wallets (World whitepaper, Tokenomics, 2025-08-04 edition), Ethereum side.
+const WLD_WHITEPAPER = 'https://whitepaper.world.org/designing-for-scale/2025-08-04';
+const WLD_WORLD_WALLETS = [
+  ['0x1770bd8186AAd27Df9B050D65f86CF2cdC92C296', 'World Community unlock contract 1 (locked, unlocks on schedule)'],
+  ['0xaEE0360b73B5D01dad134f234d3a93adc1680e57', 'World Community unlock contract 2 (locked, unlocks on schedule)'],
+  ['0x938ceD2D1eE4AFB220929F96c2eB754C053C77F7', 'World Community unlock contract 3 (locked, unlocks on schedule)'],
+  ['0x5B5442C5fcEaE3b40C230C32a3Ffe924BcBe7D93', 'World Community unlock contract 4 (locked, unlocks on schedule)'],
+  ['0xc534a745bFfaF9466Ed7B47fA23B0177b99A3e77', 'World Foundation cold wallet'],
+  ['0x59a0f98345f54bAB245A043488ECE7FCecD7B596', 'World Assets, Ltd. cold wallet'],
+  ['0xc4151Dd19A38E7224793F5aD8fBDD912750e3565', 'World Assets, Ltd. hot wallet'],
+];
 
 // TAP (TAP Protocol on Bitcoin, by Trac). Trac's public TAP Protocol reader: the REST reader Trac's own Digital Matter
 // World kit reads on mainnet. Trac's older socket endpoint, tap.trac.network, now answers 502. A second reader (any
@@ -436,6 +456,41 @@ const METHODS = {
         { reason: 'Not circulating per Venice\'s published circulating supply. Venice does not list the wallets behind it; its fact sheet gives 35M of the 100M genesis supply to Venice.ai (team 10M streaming over 24 months, Community Incentive Fund 10M, Liquidity Fund 5M)', amount: total - circulating, src: VVV_STATS },
       ],
       note: `Total read from Base: totalSupply ${fmt(supply)} VVV minus ${fmt(burned)} VVV burned at the zero and dead addresses (Venice's burn stats agree: ${fmt(vBurned)}). Circulating is Venice's own figure from its stats API (${VVV_STATS}, the feed behind venice.ai/token); it does not subtract the ${fmt(staked)} VVV staked as a whole (it is above total minus staked). Venice also reports ${fmt(locked)} VVV locked to mint DIEM and does not say whether its figure counts them.`,
+    };
+  },
+  // Worldcoin (WLD). Total is read from Ethereum: totalSupply of the WLD ERC-20 minus the dead-address balance.
+  // Optimism is read too, as a check: its WLD must name the Ethereum WLD as remoteToken, use OP's standard bridge,
+  // and not exceed the WLD locked in OP Mainnet's L1StandardBridge, so nothing is counted twice.
+  // The wallets World publishes (whitepaper, Tokenomics) are read and listed. Circulating is still withheld: World's
+  // team and investor tokens unlock linearly and have no published addresses, so total minus the listed wallets
+  // would overstate circulating. The rule can set circulating once those locks are sourced.
+  async worldcoin(r = {}) {
+    const addr = h => '0x' + String(h).slice(-40).toLowerCase();
+    const [total, dead, opTotal, opRemote, opBridge, lockedOp, lockedWorld, ...held] = await Promise.all([
+      erc20TotalSupply('eth', WLD_ETH),
+      erc20Balance('eth', WLD_ETH, BURN),
+      erc20TotalSupply('optimism', WLD_OP),
+      evm('optimism', 'eth_call', [{ to: WLD_OP, data: '0xd6c0b2c4' }, 'latest']), // remoteToken()
+      evm('optimism', 'eth_call', [{ to: WLD_OP, data: '0xe78cea92' }, 'latest']), // bridge()
+      erc20Balance('eth', WLD_ETH, OP_L1_BRIDGE),
+      erc20Balance('eth', WLD_ETH, WORLDCHAIN_L1_BRIDGE),
+      ...WLD_WORLD_WALLETS.map(([h]) => erc20Balance('eth', WLD_ETH, h)),
+    ]);
+    if (![total, dead, opTotal, lockedOp, lockedWorld, ...held].every(Number.isFinite) || !(total > 0)) throw new Error('worldcoin: bad chain read');
+    if (addr(opRemote) !== WLD_ETH.toLowerCase() || addr(opBridge) !== OP_L2_BRIDGE.toLowerCase()) throw new Error(`worldcoin: Optimism WLD is not the standard-bridged Ethereum WLD (${opRemote}, ${opBridge})`);
+    if (opTotal > lockedOp * 1.0001) throw new Error(`worldcoin: Optimism WLD ${opTotal} above the ${lockedOp} locked in the OP bridge`);
+    const net = total - dead;
+    const fmt = v => Math.round(v).toLocaleString('en-US');
+    const eth = h => `${EXPLORER.eth}/token/${WLD_ETH}?a=${h}`;
+    return {
+      circulating: r.circulating === true ? net : null,
+      total: net,
+      src: `${EXPLORER.eth}/token/${WLD_ETH}`,
+      excluded: [
+        ...(dead > 0 ? [{ reason: 'Burn address', holder: BURN, amount: dead, src: eth(BURN) }] : []),
+        ...WLD_WORLD_WALLETS.map(([h, reason], i) => ({ reason: `${reason}, per World's whitepaper`, holder: h, amount: held[i], src: WLD_WHITEPAPER })).filter(e => e.amount > 0),
+      ],
+      note: `Total read from Ethereum, where the whole supply is minted: ${fmt(total)} WLD, less ${dead.toFixed(2)} at the burn address. The ${fmt(opTotal)} WLD on Optimism (${EXPLORER.optimism}/token/${WLD_OP}) are bridged copies (remoteToken = Ethereum WLD, OP standard bridge) backed by ${fmt(lockedOp)} WLD locked in OP Mainnet's L1StandardBridge on Ethereum, so they are inside the Ethereum figure; World Chain's ${fmt(lockedWorld)} bridged WLD are locked the same way. The listed World wallets hold ${fmt(held.reduce((a, b) => a + b, 0))} WLD on Ethereum (World also lists wallets on Optimism and World Chain). Circulating is withheld: World defines circulating as tokens without transfer restrictions and its unlocked supply only as an upper bound (${WLD_WHITEPAPER}), and the team and investor tokens still unlocking have no published addresses, so total minus the listed wallets would overstate it.`,
     };
   },
   // Celestia (TIA): total is a chain read (bank supply of utia). Circulating is NOT read from the chain:
