@@ -1299,3 +1299,46 @@ test('TNK: a seed checkpoint too far behind the ledger asks for a rebuild', asyn
   delete process.env.TMC_TNK_SEED;
   tnkReset();
 });
+
+// ---------- bounty #113 — Blur ----------
+// Blur's own docs list the BLUR ERC-20 as the Token Contract (docs.blur.foundation/contracts) and
+// docs.blur.foundation/tokenomics states 3,000,000,000 BLUR minted at genesis, with the core-
+// contributor, launch-partner, advisor and community-treasury allocations vesting on multi-year
+// schedules. Blur publishes no addresses for the contracts holding the unvested BLUR, so
+// circulating cannot be assembled from primary sources: the rule publishes the chain-read total,
+// records the only provable non-circulating balance (the burn address) and withholds circulating —
+// the same treatment SEI got in merged bounty #3. Response shapes captured from eth.drpc.org
+// on 2026-11-26.
+const BLUR_CONTRACT = '0x5283D291DBCF85356A21bA090E6db59121208b44';
+const BLUR_DEAD = '0x000000000000000000000000000000000000dead';
+const BLUR_BURN_RAW = '11447778490921122248702'; // balanceOf(0x…dEaD) at the BLUR contract, read 2026-11-26
+
+test('blur: total is the contract totalSupply, the burn is recorded, circulating stays withheld', async () => {
+  const { blur } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+  const restore = fakeEth({ total: (3000000000n * 10n ** 18n).toString(), holders: { [BLUR_DEAD]: BLUR_BURN_RAW } });
+  try {
+    const s = await readSupply(blur.supply);
+    assert.equal(s.total, 3000000000, 'total is the ERC-20 totalSupply() read from the chain');
+    assert.equal(s.circulating, null, 'circulating is withheld, never overstated');
+    assert.equal(s.max, 3000000000);
+    assert.equal(s.method, 'tokens');
+    assert.equal(s.checked, true);
+    assert.equal(s.parts.length, 1, 'BLUR is a single-chain Ethereum ERC-20: exactly one part');
+    assert.equal(s.parts[0].chain, 'eth');
+    assert.match(s.parts[0].src, /etherscan\.io\/token\/0x5283d291dbcf85356a21ba090e6db59121208b44/i);
+    assert.equal(s.excluded.length, 1, 'only the burn balance is provably non-circulating');
+    assert.equal(s.excluded[0].reason, 'Burn address');
+    assert.ok(Math.abs(s.excluded[0].amount - 11447.778490921122248702) < 1e-9);
+  } finally { restore(); }
+});
+
+test('blur: the shipped rule cites Blur\'s own docs, names one ERC-20 part and withholds circulating', () => {
+  const { blur } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+  assert.equal(blur.symbol, 'BLUR');
+  assert.equal(blur.supply.method, 'tokens');
+  assert.deepEqual(blur.supply.parts, [{ chain: 'eth', address: BLUR_CONTRACT }]);
+  assert.equal(blur.supply.circulating, false, 'circulating withheld until locks are provable');
+  assert.equal(blur.supply.max, 3000000000);
+  assert.match(blur.supply.note, /docs\.blur\.foundation\/contracts/);
+  assert.match(blur.supply.note, /docs\.blur\.foundation\/tokenomics/);
+});
