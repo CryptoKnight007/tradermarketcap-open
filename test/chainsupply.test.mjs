@@ -1301,14 +1301,15 @@ test('TNK: a seed checkpoint too far behind the ledger asks for a rebuild', asyn
 });
 
 // ---------- bounty #113 — Blur ----------
-// Blur's own docs list the BLUR ERC-20 as the Token Contract (docs.blur.foundation/contracts) and
-// docs.blur.foundation/tokenomics states 3,000,000,000 BLUR minted at genesis, with the core-
-// contributor, launch-partner, advisor and community-treasury allocations vesting on multi-year
-// schedules. Blur publishes no addresses for the contracts holding the unvested BLUR, so
-// circulating cannot be assembled from primary sources: the rule publishes the chain-read total,
-// records the only provable non-circulating balance (the burn address) and withholds circulating —
-// the same treatment SEI got in merged bounty #3. Response shapes captured from eth.drpc.org
-// on 2026-11-26.
+// The BLUR ERC-20 is named on Blur's official site (blur.io) and its Etherscan token label
+// (etherscan.io/token/0x5283…8b44, mirrored by Blockscout); reading the contract on-chain returns
+// symbol BLUR, 18 decimals and totalSupply exactly 3,000,000,000. Blur publishes no addresses for
+// the contracts holding the core-contributor, launch-partner, advisor and community-treasury
+// allocations, so circulating cannot be assembled from primary sources: the rule publishes the
+// chain-read total, records the only provable non-circulating balance (the burn address) and
+// withholds circulating — the same treatment SEI got in merged bounty #3. No published cap is
+// carried as max (no primary source states one). Response shapes captured from eth.drpc.org
+// on 2026-11-26; live eth_call verification of totalSupply 3e9 and the burn balance done 2026-11-26.
 const BLUR_CONTRACT = '0x5283D291DBCF85356A21bA090E6db59121208b44';
 const BLUR_DEAD = '0x000000000000000000000000000000000000dead';
 const BLUR_BURN_RAW = '11447778490921122248702'; // balanceOf(0x…dEaD) at the BLUR contract, read 2026-11-26
@@ -1320,7 +1321,7 @@ test('blur: total is the contract totalSupply, the burn is recorded, circulating
     const s = await readSupply(blur.supply);
     assert.equal(s.total, 3000000000, 'total is the ERC-20 totalSupply() read from the chain');
     assert.equal(s.circulating, null, 'circulating is withheld, never overstated');
-    assert.equal(s.max, 3000000000);
+    assert.equal(s.max, null, 'no published cap carried: no primary source states one');
     assert.equal(s.method, 'tokens');
     assert.equal(s.checked, true);
     assert.equal(s.parts.length, 1, 'BLUR is a single-chain Ethereum ERC-20: exactly one part');
@@ -1332,15 +1333,16 @@ test('blur: total is the contract totalSupply, the burn is recorded, circulating
   } finally { restore(); }
 });
 
-test('blur: the shipped rule cites Blur\'s own docs, names one ERC-20 part and withholds circulating', () => {
+test('blur: the shipped rule cites resolvable primary sources, names one ERC-20 part and withholds circulating', () => {
   const { blur } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
   assert.equal(blur.symbol, 'BLUR');
   assert.equal(blur.supply.method, 'tokens');
   assert.deepEqual(blur.supply.parts, [{ chain: 'eth', address: BLUR_CONTRACT }]);
   assert.equal(blur.supply.circulating, false, 'circulating withheld until locks are provable');
-  assert.equal(blur.supply.max, 3000000000);
-  assert.match(blur.supply.note, /docs\.blur\.foundation\/contracts/);
-  assert.match(blur.supply.note, /docs\.blur\.foundation\/tokenomics/);
+  assert.equal('max' in blur.supply, false, 'no unevidenced cap carried');
+  assert.match(blur.supply.note, /blur\.io/);
+  assert.match(blur.supply.note, /etherscan\.io\/token\/0x5283d291dbc/i);
+  assert.doesNotMatch(blur.supply.note, /blur\.foundation/, 'the dead blur.foundation domains are gone');
 });
 
 // Venice (VVV, Base). Real responses captured 2026-11-26 (test/fixtures/venice.json).
