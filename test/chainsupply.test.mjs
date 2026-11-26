@@ -1300,6 +1300,55 @@ test('TNK: a seed checkpoint too far behind the ledger asks for a rebuild', asyn
   tnkReset();
 });
 
+// ---------- bounty #113 — Blur ----------
+// The BLUR ERC-20 is the Etherscan token page
+// https://etherscan.io/token/0x5283D291DBCF85356A21bA090E6db59121208b44 (title Blur (BLUR),
+// Max Total Supply 3,000,000,000 BLUR) and the verified source
+// https://etherscan.io/address/0x5283D291DBCF85356A21bA090E6db59121208b44#code
+// (contract BlurToken, INITIAL_SUPPLY = 3_000_000_000, minted once in the constructor, no later mint).
+// Blur publishes no addresses for the contracts holding the core-contributor, launch-partner,
+// advisor and community-treasury allocations, so circulating cannot be assembled from primary
+// sources: the rule publishes the chain-read total, records the only provable non-circulating
+// balance (the burn address) and withholds circulating — the same treatment SEI got in merged
+// bounty #3. max is that verified INITIAL_SUPPLY. Response shapes captured from eth.drpc.org
+// on 2026-11-26; live eth_call verification of totalSupply 3e9 and the burn balance done 2026-11-26.
+const BLUR_CONTRACT = '0x5283D291DBCF85356A21bA090E6db59121208b44';
+const BLUR_DEAD = '0x000000000000000000000000000000000000dead';
+const BLUR_BURN_RAW = '11447778490921122248702'; // balanceOf(0x…dEaD) at the BLUR contract, read 2026-11-26
+
+test('blur: total is the contract totalSupply, the burn is recorded, circulating stays withheld', async () => {
+  const { blur } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+  const restore = fakeEth({ total: (3000000000n * 10n ** 18n).toString(), holders: { [BLUR_DEAD]: BLUR_BURN_RAW } });
+  try {
+    const s = await readSupply(blur.supply);
+    assert.equal(s.total, 3000000000, 'total is the ERC-20 totalSupply() read from the chain');
+    assert.equal(s.circulating, null, 'circulating is withheld, never overstated');
+    assert.equal(s.max, 3000000000, 'max is the verified INITIAL_SUPPLY of 3_000_000_000');
+    assert.equal(s.method, 'tokens');
+    assert.equal(s.checked, true);
+    assert.equal(s.parts.length, 1, 'BLUR is a single-chain Ethereum ERC-20: exactly one part');
+    assert.equal(s.parts[0].chain, 'eth');
+    assert.match(s.parts[0].src, /etherscan\.io\/token\/0x5283d291dbcf85356a21ba090e6db59121208b44/i);
+    assert.equal(s.excluded.length, 1, 'only the burn balance is provably non-circulating');
+    assert.equal(s.excluded[0].reason, 'Burn address');
+    assert.ok(Math.abs(s.excluded[0].amount - 11447.778490921122248702) < 1e-9);
+  } finally { restore(); }
+});
+
+test('blur: the shipped rule cites resolvable primary sources, names one ERC-20 part and withholds circulating', () => {
+  const { blur } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+  assert.equal(blur.symbol, 'BLUR');
+  assert.equal(blur.supply.method, 'tokens');
+  assert.deepEqual(blur.supply.parts, [{ chain: 'eth', address: BLUR_CONTRACT }]);
+  assert.equal(blur.supply.circulating, false, 'circulating withheld until locks are provable');
+  assert.equal(blur.supply.max, 3000000000, 'max is the verified INITIAL_SUPPLY');
+  assert.match(blur.supply.note, /https:\/\/etherscan\.io\/token\/0x5283D291DBCF85356A21bA090E6db59121208b44/);
+  assert.match(blur.supply.note, /https:\/\/etherscan\.io\/address\/0x5283D291DBCF85356A21bA090E6db59121208b44#code/);
+  assert.match(blur.supply.note, /INITIAL_SUPPLY = 3_000_000_000/);
+  assert.doesNotMatch(blur.supply.note, /blur\.foundation/, 'the dead blur.foundation domains are gone');
+  assert.doesNotMatch(blur.supply.note, /blur\.io/, 'blur.io does not name the token contract');
+});
+
 // Venice (VVV, Base). Real responses captured 2026-11-26 (test/fixtures/venice.json).
 const VVV_FX = JSON.parse(readFileSync(new URL('./fixtures/venice.json', import.meta.url), 'utf8'));
 function fakeVenice({ stats = VVV_FX.vvv_stats, burn = VVV_FX.vvv_burn_stats, rpc = VVV_FX.rpc, apiStatus = 200 } = {}) {
