@@ -1423,3 +1423,51 @@ test('WLD: a non-standard Optimism token, more WLD on Optimism than locked, or a
   fakeWld({ eth: { '0x18160ddd': new Error('down') } });
   await assert.rejects(readSupply({ method: 'worldcoin' }), /503/);
 });
+
+// Pump.fun: the official mint is fixed, but team/investor/ecosystem/foundation wallets are not
+// published, so the rule publishes the live chain total and withholds circulating.
+const PUMP_MINT = 'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn';
+
+test('pump-fun: seed rule reads the Solana mint total and withholds circulating', async () => {
+  const coins = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+  const pump = coins['pump-fun'];
+  assert.equal(pump.symbol, 'PUMP');
+  assert.equal(pump.name, 'Pump.fun');
+  assert.equal(pump.supply.method, 'tokens');
+  assert.equal(pump.supply.circulating, false);
+  assert.equal(pump.supply.max, 1000000000000);
+  assert.equal(pump.supply.parts.length, 1);
+  assert.equal(pump.supply.parts[0].chain, 'sol');
+  assert.equal(pump.supply.parts[0].address, PUMP_MINT);
+
+  const restore = fakeSol({ total: '820375385290371930', holders: {} });
+  try {
+    const s = await readSupply(pump.supply);
+    assert.equal(s.circulating, null, 'circulating is withheld, never overstated');
+    assert.ok(Math.abs(s.total - 820375385290.37193) < 0.01);
+    assert.equal(s.max, 1000000000000);
+    assert.equal(s.parts.length, 1);
+    assert.equal(s.parts[0].src, `https://solscan.io/token/${PUMP_MINT}`);
+    assert.equal(s.excluded.length, 0, 'no guessed lock wallets are listed');
+    assert.match(s.note, /Circulating is withheld/);
+    assert.equal(s.checked, true);
+    assert.equal(s.method, 'tokens');
+  } finally { restore(); }
+});
+
+test('pump-fun: Solana RPC errors and NaN fail the read instead of guessing a supply', async () => {
+  globalThis.fetch = async () => ({ ok: false, status: 500, json: async () => ({ error: 'rpc fail' }) });
+  await assert.rejects(readSupply({
+    method: 'tokens',
+    parts: [{ chain: 'sol', address: PUMP_MINT }],
+    circulating: false,
+  }), /500/);
+  const restore = fakeSol({ total: 'NaN' });
+  try {
+    await assert.rejects(readSupply({
+      method: 'tokens',
+      parts: [{ chain: 'sol', address: PUMP_MINT }],
+      circulating: false,
+    }));
+  } finally { restore(); }
+});

@@ -393,6 +393,8 @@ const METHODS = {
       total += t;
       parts.push({ chain: p.chain, amount: t, src: tokenLink(p) });
     }
+    // Never publish a number derived from a failed or malformed chain read.
+    if (!Number.isFinite(total) || !(total > 0)) throw new Error('tokens: bad total supply');
     const excluded = [];
     const ex = [...(r.exclude || []), ...r.parts.filter(p => EXPLORER[p.chain] && !r.noBurn).map(p => ({ chain: p.chain, token: p.address, holder: BURN, reason: 'Burn address' }))];
     for (const e of ex) {
