@@ -367,9 +367,13 @@ const METHODS = {
     return { circulating: total - excluded.reduce((s, e) => s + e.amount, 0), total, src: sub, excluded };
   },
   // Cosmos SDK chains: bank supply of one denom, minus the community pool (and any listed treasury accounts).
+  // A rule may set circulating:false to publish the total and withhold circulating, for chains whose
+  // non-circulating allocations are not provable itemizable wallets (see the initia note in coins.json).
   async cosmos(r) {
     const dec = 10 ** (r.decimals ?? 6);
     const total = Number((await getJSON(`${r.lcd}/cosmos/bank/v1beta1/supply/by_denom?denom=${r.denom}`)).amount.amount) / dec;
+    // fail closed: a broken or non-numeric LCD read must not publish a number (bounty #141)
+    if (!Number.isFinite(total) || !(total > 0)) throw new Error(`cosmos ${r.denom || ''}: bank supply is not a positive number (from ${r.lcd})`);
     const excluded = [];
     if (r.communityPool !== false) {
       const p = (await getJSON(`${r.lcd}/cosmos/distribution/v1beta1/community_pool`)).pool.find(x => x.denom === r.denom);
@@ -379,7 +383,10 @@ const METHODS = {
       const b = (await getJSON(`${r.lcd}/cosmos/bank/v1beta1/balances/${e.holder}/by_denom?denom=${r.denom}`)).balance;
       excluded.push({ reason: e.reason, holder: e.holder, amount: Number(b.amount) / dec, src: r.explorer ? r.explorer + e.holder : undefined });
     }
-    return { circulating: total - excluded.reduce((s, e) => s + e.amount, 0), total, src: r.explorer || r.lcd, excluded, note: r.note };
+    const out = { circulating: null, total, src: r.explorer || r.lcd, excluded, note: r.note };
+    if (r.circulating === false) return out; // publish total only; circulating is not provable for this chain
+    out.circulating = total - excluded.reduce((s, e) => s + e.amount, 0);
+    return out;
   },
   // Algorand: total ALGO from a public algod node, minus the Algorand Foundation wallets the Foundation
   // publishes at algorand.co/algorand-foundation/transparency (archived copy cited in coins.json; the

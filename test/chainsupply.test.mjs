@@ -2286,3 +2286,80 @@ test('monad: invalid configuration fails closed rather than guessing', async () 
   }
   assert.equal(globalThis.fetch, prev, 'globalThis.fetch is restored after test');
 });
+
+// ---- bounty #141: Initia (INIT) ----
+// INIT trades on the site with no supply rule. Its own chain is a Cosmos SDK chain (chain_id
+// interwoven-1) whose bank supply of uinit reads exactly the fixed 1B genesis mint from the
+// chain's public LCD; the team/investor/foundation/VIP locks are documented but not published as
+// itemizable wallets, so the rule publishes total and withholds circulating (issue #141's own
+// fallback), listing only the provable community-pool exclusion.
+const INITIA_LCD = 'https://rest.initia.xyz';
+function fakeInitiaLcd(overrides = {}) {
+  const prev = globalThis.fetch;
+  globalThis.fetch = async url => {
+    const u = String(url);
+    assert.ok(u.startsWith(INITIA_LCD + '/'), 'initia rule must read only its own LCD: ' + u);
+    if (u.includes('/cosmos/bank/v1beta1/supply/by_denom?denom=uinit'))
+      return { ok: true, json: async () => overrides.supply ?? { amount: { denom: 'uinit', amount: '1000000000000000' } } };
+    if (u.includes('/cosmos/distribution/v1beta1/community_pool'))
+      return { ok: true, json: async () => overrides.pool ?? { pool: [{ denom: 'uinit', amount: '483064043482.706274570695195000' }] } };
+    throw new Error('unexpected fetch ' + u);
+  };
+  return { restore: () => { globalThis.fetch = prev; } };
+}
+const seedCoin = k => JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'))[k];
+
+test('bounty #141 initia: seed rule reads the 1B total from Initia\'s own LCD, lists the community pool, and withholds circulating', async () => {
+  const rule = seedCoin('initia').supply;
+  assert.equal(seedCoin('initia').symbol, 'INIT');
+  assert.equal(rule.method, 'cosmos');
+  assert.equal(rule.lcd, INITIA_LCD);
+  assert.equal(rule.denom, 'uinit');
+  assert.equal(rule.circulating, false, 'circulating is withheld per issue #141');
+  assert.match(rule.note, /1,000,000,000|1 billion/);
+  assert.match(rule.note, /docs\.initia\.xyz\/home\/core-concepts\/init-token\/tokenomics/);
+  const f = fakeInitiaLcd();
+  try {
+    const s = await readSupply(rule);
+    assert.equal(s.total, 1_000_000_000);
+    assert.equal(s.circulating, null, 'must not publish an unprovable circulating figure');
+    assert.equal(s.excluded.length, 1);
+    assert.equal(s.excluded[0].reason, 'Community pool (on-chain treasury)');
+    assert.ok(Math.abs(s.excluded[0].amount - 483_064.043482706) < 1e-3);
+    assert.equal(s.src, INITIA_LCD);
+    assert.equal(s.checked, true);
+  } finally { f.restore(); }
+});
+
+test('bounty #141 initia: a broken, non-numeric, zero or negative LCD read fails closed instead of publishing NaN', async () => {
+  const base = { method: 'cosmos', lcd: INITIA_LCD, denom: 'uinit', circulating: false };
+  for (const supply of [
+    { amount: {} }, // no amount field -> NaN
+    { amount: { amount: 'not-a-number' } }, // garbage
+    { amount: { amount: '0' } }, // empty supply is never a publishable total
+    { amount: { amount: '-5000000' } }, // negatives cannot be a supply
+  ]) {
+    const f = fakeInitiaLcd({ supply });
+    try { await assert.rejects(readSupply(base), /not a positive number/); }
+    finally { f.restore(); }
+  }
+});
+
+test('bounty #141: a cosmos rule WITHOUT circulating:false still publishes total minus the community pool', async () => {
+  // regression guard for the shared cosmos method: the withhold flag must not change existing behaviour
+  const prev = globalThis.fetch;
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.includes('/cosmos/bank/v1beta1/supply/by_denom?denom=uatom'))
+      return { ok: true, json: async () => ({ amount: { denom: 'uatom', amount: '400000000000' } }) };
+    if (u.includes('/cosmos/distribution/v1beta1/community_pool'))
+      return { ok: true, json: async () => ({ pool: [{ denom: 'uatom', amount: '5000000' }] }) };
+    throw new Error('unexpected fetch ' + u);
+  };
+  try {
+    const s = await readSupply({ method: 'cosmos', lcd: 'https://lcd.example', denom: 'uatom' });
+    assert.equal(s.total, 400_000);
+    assert.equal(s.circulating, 399_995); // 400k minus the 5 ATOM community pool
+    assert.equal(s.excluded.length, 1);
+  } finally { globalThis.fetch = prev; }
+});
