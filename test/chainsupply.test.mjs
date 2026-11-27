@@ -2548,3 +2548,138 @@ test('ripple-usd: fails closed on XRPL/Ethereum errors, NaN obligations, wrong i
     globalThis.fetch = prev;
   }
 });
+
+// ---------- okb (bounty #140) ----------
+// The rule must publish ONLY the fixed 21,000,000 total (native X Layer gas coin), withhold circulating,
+// and fail closed unless the live Ethereum reads confirm identity (symbol OKB, 18 decimals, sane legacy
+// totalSupply) and the self-destruct of the pre-migration contract.
+const okbEncStr = s => {
+  const hex = Buffer.from(s, 'utf8').toString('hex');
+  return '0x' + (32).toString(16).padStart(64, '0') + (hex.length / 2).toString(16).padStart(64, '0') + hex.padEnd(Math.ceil(hex.length / 64) * 64, '0');
+};
+const okbEncUint = n => '0x' + BigInt(n).toString(16).padStart(64, '0');
+const OKB_LEGACY_WEI = 429063577598083360000000n; // live 2026-11-27 value of the migration-residue L1 ledger (429,063.57759808336 OKB)
+
+function mockOkbRpc(over = {}) {
+  const prev = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    const req = JSON.parse(opts.body);
+    calls.push({ method: req.method, params: req.params });
+    const reply = result => ({ ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, result }) });
+    if (over.rpcError) return { ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, error: { message: over.rpcError } }) };
+    if (req.method === 'eth_chainId') return reply(over.chainId ?? '0xc4');
+    if (req.method === 'net_version') return reply(over.netVersion ?? '196');
+    if (req.method === 'eth_getCode') return reply(over.oldCode ?? '0x');
+    const d = req.params?.[0]?.data;
+    if (d === '0x95d89b41') return reply(over.symbol ?? okbEncStr('OKB'));
+    if (d === '0x313ce567') return reply(over.decimals ?? okbEncUint(18));
+    if (d === '0x18160ddd') return reply(over.totalSupply ?? okbEncUint(OKB_LEGACY_WEI));
+    throw new Error('unexpected okb mock call ' + req.method + ' ' + d);
+  };
+  return { calls, restore: () => { globalThis.fetch = prev; } };
+}
+
+test('okb: publishes the fixed 21M total, withholds circulating, carries the seed cap', async () => {
+  const m = mockOkbRpc();
+  try {
+    const rule = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8')).okb;
+    assert.equal(rule.supply.method, 'okb');
+    assert.equal(rule.supply.max, 21000000);
+    const s = await readSupply(rule.supply);
+    assert.equal(s.total, 21000000);
+    assert.equal(s.circulating, null);
+    assert.equal(s.max, 21000000);
+    assert.equal(s.checked, true);
+    assert.match(s.src, /^https:\/\/www\.okx\.com\/help\/announcement-on-the-pp-upgrade-of-x-layer-and-optimisation-of-the-okb-gas/);
+    assert.match(s.note, /429,064/); // live legacy ledger figure (rounded) surfaced in the note
+    assert.match(s.note, /etherscan\.io\/token\/0x75231f58b43240c9718dd58b4967c5114342a86c/);
+    assert.match(s.note, /self-destructed/i);
+    // all four integrity reads happened
+    const reads = m.calls.map(c => c.params?.[0]?.data ?? c.method);
+    assert.ok(m.calls.some(c => c.method === 'eth_getCode' && c.params[0] === '0x8d0d2250c6457061cdb86b4139b5511c75b01f2f'));
+    assert.ok(reads.includes('0x95d89b41') && reads.includes('0x313ce567') && reads.includes('0x18160ddd'));
+  } finally {
+    m.restore();
+  }
+});
+
+test('okb: fails closed on wrong symbol', async () => {
+  const m = mockOkbRpc({ symbol: okbEncStr('WOKB') });
+  try {
+    await assert.rejects(readSupply({ method: 'okb' }), /unexpected symbol "WOKB"/);
+  } finally {
+    m.restore();
+  }
+});
+
+test('okb: fails closed when decimals are not 18', async () => {
+  const m = mockOkbRpc({ decimals: okbEncUint(6) });
+  try {
+    await assert.rejects(readSupply({ method: 'okb' }), /unexpected decimals 6/);
+  } finally {
+    m.restore();
+  }
+});
+
+test('okb: fails closed on a zero or unreadable legacy totalSupply', async () => {
+  const m = mockOkbRpc({ totalSupply: '0x00' });
+  try {
+    await assert.rejects(readSupply({ method: 'okb' }), /bad legacy totalSupply/);
+  } finally {
+    m.restore();
+  }
+  const m2 = mockOkbRpc({ totalSupply: 'not-hex' });
+  try {
+    await assert.rejects(readSupply({ method: 'okb' }), /unreadable totalSupply/);
+  } finally {
+    m2.restore();
+  }
+});
+
+test('okb: fails closed when the pre-migration contract still has code (phase-out premise changed)', async () => {
+  const m = mockOkbRpc({ oldCode: '0x60806040' });
+  try {
+    await assert.rejects(readSupply({ method: 'okb' }), /pre-migration OKB contract still has code/);
+  } finally {
+    m.restore();
+  }
+});
+
+test('okb: propagates Ethereum RPC errors instead of publishing', async () => {
+  const m = mockOkbRpc({ rpcError: 'execution reverted' });
+  try {
+    await assert.rejects(readSupply({ method: 'okb' }), /execution reverted/);
+  } finally {
+    m.restore();
+  }
+});
+
+test('okb: fails closed when the X Layer RPC identity drifts off chain 196', async () => {
+  const m = mockOkbRpc({ chainId: '0x1' });
+  try {
+    await assert.rejects(readSupply({ method: 'okb' }), /X Layer RPC answered eth_chainId=0x1/);
+  } finally {
+    m.restore();
+  }
+  const m2 = mockOkbRpc({ netVersion: '1' });
+  try {
+    await assert.rejects(readSupply({ method: 'okb' }), /net_version=1, not chain 196/);
+  } finally {
+    m2.restore();
+  }
+});
+
+test('okb: rule, note and links cite only official OKX/on-chain sources', async () => {
+  const m = mockOkbRpc();
+  try {
+    const rule = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8')).okb;
+    const s = await readSupply(rule.supply);
+    const blob = JSON.stringify({ supply: rule.supply, links: rule.links, out: { total: s.total, circulating: s.circulating, max: s.max, src: s.src, note: s.note } });
+    assert.doesNotMatch(blob, /coingecko|coinmarketcap|coindesk|binance\.com\/price/i);
+    // circulating is withheld, never guessed
+    assert.equal(s.circulating, null);
+  } finally {
+    m.restore();
+  }
+});

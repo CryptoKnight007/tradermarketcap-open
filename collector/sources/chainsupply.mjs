@@ -1708,6 +1708,65 @@ const METHODS = {
       note: r.note || `Total is the Ethereum ERC-20 totalSupply (${fmt(ethTotal)} RLUSD at ${EXPLORER.eth}/token/${RLUSD_ETH}) plus XRP Ledger issuer obligations (${fmt(xrplTotal)} RLUSD issued by ${RLUSD_XRPL_ISSUER} at ledger ${ledgerIndex}; ${RLUSD_SITE_SRC}). Bridged L2 copies (such as Base via Wormhole NTT) are backed by RLUSD locked on Ethereum and are not added again. Circulating subtracts ${fmt(nonCirculating)} RLUSD held in Ripple's XRPL distribution/treasury hotwallets (verified via gateway_balances hotwallet and XRPSCAN ripple.com labels), Ethereum MINTER_ROLE and BURNER_ROLE redemption multisigs (verified live via AccessControl.hasRole on ${RLUSD_ETH}), tokens stuck at the token proxy contract itself, and burn addresses.`,
     };
   },
+
+  // OKB (bounty #140): OKB is the native gas coin of X Layer (chain id 196, an EVM L2 whose gas coin is
+  // custom — there is no on-chain native totalSupply() to read). Its canonical total is the fixed
+  // 21,000,000 OKB set by OKX's official announcement: a one-time burn of 65,256,712.097 OKB from
+  // historical repurchases and treasury reserves, after which "the total OKB supply will be fixed at
+  // 21 million" and the 2025-08-18 contract upgrade permanently removed minting and burning
+  // (https://www.okx.com/help/announcement-on-the-pp-upgrade-of-x-layer-and-optimisation-of-the-okb-gas).
+  // OKB is the ONLY gas and native token of X Layer, so bridged supply is counted once, on X Layer;
+  // publishing the Ethereum-side figure instead would double-count and overstate it.
+  // The rule still cross-checks the Ethereum side live on every read: the L1 ERC-20 ledger
+  // OKB_ETH_LEGACY must answer symbol OKB / 18 decimals with a sane totalSupply(), and the pre-migration
+  // contract OKB_ETH_OLD must be self-destructed (eth_getCode == 0x) — the on-chain evidence of the L1
+  // phase-out the announcement describes. Neither Ethereum number is published as the total:
+  // OKB_ETH_LEGACY's totalSupply (~429K OKB, live 2026-11-27) is migration residue left on the L1
+  // version being phased out; holders' supply now lives on X Layer, and the burn is already baked
+  // into the fixed 21M. X Layer's own identity (eth_chainId == 196, net_version == '196') is re-
+  // verified on every read via the public RPC, which does not whitelist eth_totalSupply.
+  // Circulating is WITHHELD: no primary source lists team/treasury/vesting/lock wallets for the 21M
+  // supply (a total-minus-known figure could only be an overhang guess), and post-announcement blackhole
+  // burns are not subtracted because the blackhole addresses are not published.
+  async okb(r = {}) {
+    const token = (r.address || OKB_ETH_LEGACY).toLowerCase();
+    if (!/^0x[0-9a-f]{40}$/.test(token)) throw new Error('okb: bad token address');
+    const [symHex, decHex, supHex, oldCode, xc, xv] = await Promise.all([
+      evm('eth', 'eth_call', [{ to: token, data: '0x95d89b41' }, 'latest']), // symbol()
+      evm('eth', 'eth_call', [{ to: token, data: '0x313ce567' }, 'latest']), // decimals()
+      evm('eth', 'eth_call', [{ to: token, data: '0x18160ddd' }, 'latest']), // totalSupply()
+      evm('eth', 'eth_getCode', [OKB_ETH_OLD.toLowerCase(), 'latest']),
+      okbRpc(OKB_XLAYER_RPC, 'eth_chainId', []),
+      okbRpc(OKB_XLAYER_RPC, 'net_version', []),
+    ]);
+    const symRaw = String(symHex || '');
+    if (!/^0x[0-9a-f]*$/i.test(symRaw) || symRaw.length < 130) {
+      throw new Error(`okb: unreadable symbol bytes from ${token}`);
+    }
+    const symOff = parseInt(symRaw.slice(2, 66), 16);
+    const symLen = parseInt(symRaw.slice(2 + 2 * symOff, 66 + 2 * symOff), 16);
+    if (symOff !== 32 || !Number.isInteger(symLen) || symLen < 1 || symLen > 32 || symRaw.length < 66 + 2 * symOff + symLen * 2) {
+      throw new Error(`okb: unreadable symbol bytes from ${token}`);
+    }
+    const symbol = Buffer.from(symRaw.slice(66 + 2 * symOff, 66 + 2 * symOff + symLen * 2), 'hex').toString('utf8').replace(/\0+$/, '').trim();
+    if (symbol !== 'OKB') throw new Error(`okb: unexpected symbol "${symbol}" read from ${token} — refusing to label the ledger`);
+    const dec = parseInt(decHex, 16);
+    if (dec !== 18) throw new Error(`okb: unexpected decimals ${dec} on ${token} — refusing to scale supply`);
+    let legacy;
+    try { legacy = Number(BigInt(supHex)) / 1e18; } catch { throw new Error(`okb: unreadable totalSupply on ${token}`); }
+    if (!Number.isFinite(legacy) || legacy <= 0) throw new Error(`okb: bad legacy totalSupply read ${supHex}`);
+    if (String(oldCode || '') !== '0x') throw new Error('okb: pre-migration OKB contract still has code — the L1 phase-out premise changed, refusing to publish');
+    if (String(xc || '').toLowerCase() !== '0xc4' || String(xv) !== '196') {
+      throw new Error(`okb: X Layer RPC answered eth_chainId=${xc} net_version=${xv}, not chain 196 — refusing to publish against an unverified chain`);
+    }
+    const fmt = v => Math.round(v).toLocaleString('en-US');
+    return {
+      circulating: null,
+      total: OKB_TOTAL_SUPPLY_FIXED,
+      src: OKB_SRC,
+      note: r.note || `Total is the fixed 21,000,000 OKB total supply of X Layer's native gas coin (chain id 196; official network docs https://web3.okx.com/onchainos/dev-docs/xlayer/developer/build-on-xlayer/network-information, public RPC https://rpc.xlayer.tech, official explorer https://www.okx.com/web3/explorer/xlayer). OKX's official OKB announcement (2025-08-13, ${OKB_SRC}) records a one-time burn of 65,256,712.097 OKB accumulated from historical repurchases and treasury reserves and states that afterwards "the total OKB supply will be fixed at 21 million"; the 2025-08-18 OKB contract upgrade permanently removed the minting and burning functions. OKB is the only gas and native token of X Layer, so bridged supply is counted once on-chain, and post-announcement blackhole auto-burns are not subtracted here because no primary source publishes the blackhole addresses. The Ethereum side is cross-checked live on every read: the current ERC-20 ledger ${token} answers symbol OKB / 18 decimals and its totalSupply() reads ${fmt(legacy)} OKB (${EXPLORER.eth}/token/${token}) — the pre-migration ledger OKX is phasing out, holding only migration residue (holders' supply now lives on X Layer), so it is deliberately NOT published as the OKB total: counting it alongside X Layer would double-count bridged supply. The pre-migration contract ${OKB_ETH_OLD} is verified self-destructed on every read (eth_getCode returns 0x), the on-chain evidence of the L1 phase-out. Circulating is withheld: no primary source lists team, treasury, vesting or lock wallet addresses for the 21M supply, so no total-minus-known figure can be derived without overstating it.`,
+    };
+  },
 };
 
 const MONAD_RPC = 'https://rpc.monad.xyz';
@@ -1742,6 +1801,22 @@ const RLUSD_ETH_ROLE_VAULTS = [
   ['0x860A80BD349dc4E46DC7345600eb627552ff898e', RLUSD_BURNER_ROLE, 'BURNER', 'Ripple RLUSD Burner redemption multisig (verified on-chain BURNER_ROLE)'],
   ['0xB723D5ef303711d774FED6435ED6F5E82ED155ea', RLUSD_BURNER_ROLE, 'BURNER', 'Ripple RLUSD Burner redemption multisig (verified on-chain BURNER_ROLE)'],
 ];
+
+// OKB (bounty #140) — see the okb method above for the full sourcing rationale.
+// OKB_ETH_LEGACY is the current Ethereum ERC-20 ledger being phased out (Blockscout-verified,
+// https://etherscan.io/token/0x75231F58b43240C9718Dd58B4967c5114342a86c); OKB_ETH_OLD is the pre-migration
+// contract, whose self-destruct (eth_getCode == 0x) the rule verifies live before publishing.
+const OKB_ETH_LEGACY = '0x75231F58b43240C9718Dd58B4967c5114342a86c';
+const OKB_ETH_OLD = '0x8d0D2250c6457061cdb86B4139b5511c75B01F2f';
+const OKB_TOTAL_SUPPLY_FIXED = 21_000_000;
+const OKB_SRC = 'https://www.okx.com/help/announcement-on-the-pp-upgrade-of-x-layer-and-optimisation-of-the-okb-gas';
+const OKB_XLAYER_RPC = 'https://rpc.xlayer.tech'; // X Layer's public RPC (chain 196); no key, does not whitelist eth_totalSupply
+async function okbRpc(url, method, params) {
+  const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(12000) });
+  const body = await res.json();
+  if (body.error) throw new Error(`okb: X Layer RPC ${method} failed: ${body.error.message || 'error'}`);
+  return body.result;
+}
 
 const AMANTRA = 10n ** 18n;
 const MANTRA_BURN = 'mantra1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqcg2my8';

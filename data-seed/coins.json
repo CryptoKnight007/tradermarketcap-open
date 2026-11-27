@@ -315,5 +315,17 @@
     "supply": {
       "method": "rlusd"
     }
+  },
+  "okb": {
+    "symbol": "OKB",
+    "name": "OKB",
+    "links": {
+      "site": "https://web3.okx.com/onchainos/dev-docs/xlayer/developer/build-on-xlayer/network-information",
+      "contract": "https://etherscan.io/token/0x75231F58b43240C9718Dd58B4967c5114342a86c"
+    },
+    "supply": {
+      "method": "okb",
+      "max": 21000000
+    }
   }
 }
